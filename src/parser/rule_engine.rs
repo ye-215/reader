@@ -8,7 +8,7 @@ use crate::parser::{
     jsonpath,
     rule_analyzer::split_top_level,
 };
-use crate::util::text::{apply_regex_replace, normalize_source_url};
+use crate::util::text::{apply_regex_replace, cached_regex, normalize_source_url};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -850,60 +850,52 @@ impl RuleEngine {
         result
     }
 
-    /// Get the next content page URL if pagination exists
+    /// 对齐 legado `getStringList(nextContentUrl, isUrl=true)`：返回本章的**全部**
+    /// 续页 URL，而不只是第一个。
+    ///
+    /// 书源规范（`book-source-rules.md`）允许一条 `nextContentUrl` 规则产出多个 URL：
+    /// 1 个时顺序递归，多个时一次抓完。此前实现只取第一个（`.find()`），导致像
+    /// 「第一版主820」那样在 `chapterPages` 里一次列出 `_1/_2/_3` 全部页码的书源
+    /// 只抓到第一页、漏掉后续页。多值模式交给 `eval_rule_on(list=true)`，它内部
+    /// 对 CSS/JSONPath/XPath/Regex/JS 各分支都走多值提取，与 `toc_next_urls` 一致。
+    pub fn next_content_urls(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+    ) -> Vec<String> {
+        let rule = source.rule_content.clone().unwrap_or_default();
+        let Some(next_rule) = rule.next_content_url.as_deref() else {
+            return Vec::new();
+        };
+        if next_rule.trim().is_empty() {
+            return Vec::new();
+        }
+
+        RuleEngine::eval_rule_on(next_rule, body, base_url, true)
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            // legado getStringList(isUrl=true) 的收尾：过滤空 URL 与 JS 的空哨兵值
+            .filter(|value| {
+                !value.is_empty() && value != "null" && value != "undefined"
+            })
+            .map(|value| resolve_url(base_url, &value))
+            .collect()
+    }
+
+    /// Get the next content page URL if pagination exists.
+    ///
+    /// 保留为单值 wrapper，兼容调试接口与既有调用；正文分页抓取请用
+    /// [`Self::next_content_urls`] 以支持一次返回多个续页 URL 的书源。
     pub fn next_content_url(
         &self,
         source: &BookSource,
         body: &str,
         base_url: &str,
     ) -> Option<String> {
-        let rule = source.rule_content.clone().unwrap_or_default();
-        let next_rule = rule.next_content_url.as_deref()?;
-        if next_rule.trim().is_empty() {
-            return None;
-        }
-
-        // `nextContentUrl` 和正文规则一样支持 `选择器@js:脚本` 组合
-        // (`#linkNext@href@js:/_/.test(result) ? result : null`)。整条当 CSS
-        // 选择器解析的话，分页链接永远取不到，多页正文只剩第一页。
-        let mode = self.detect_mode(next_rule, body);
-        let next_url = match mode {
-            ParseMode::JsonPath => serde_json::from_str::<Value>(body)
-                .ok()
-                .and_then(|v| jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(next_rule))),
-            ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(next_rule))
-                .into_iter()
-                .find(|value| !value.trim().is_empty()),
-            ParseMode::Js | ParseMode::Regex => RuleEngine::eval_rule_on(next_rule, body, base_url, false)
-                .into_iter()
-                .find(|value| !value.trim().is_empty()),
-            ParseMode::Css => {
-                // 组合规则(`@href@js:…`)先按 `@js:` 切分：前半段是选择器,
-                // 后半段以取到的值为 `result` 求值。
-                let (pure, script) = extract_js(next_rule);
-                let doc = html::parse_document(body);
-                let extracted = if pure.trim().is_empty() {
-                    String::new()
-                } else {
-                    html::select_text(&doc, self.strip_mode_prefix(pure)).unwrap_or_default()
-                };
-                match script {
-                    Some(script) if !script.trim().is_empty() => match eval_js(script, &extracted, base_url) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            push_js_log(format!("[nextContentUrl JS] {error}"));
-                            None
-                        }
-                    },
-                    _ => Some(extracted),
-                }
-            }
-        };
-
-        let next_url = next_url
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty() && value != "null" && value != "undefined")?;
-        Some(resolve_url(base_url, &next_url))
+        self.next_content_urls(source, body, base_url)
+            .into_iter()
+            .next()
     }
 
     fn search_detail_fallback(
@@ -2529,7 +2521,7 @@ fn regex_extract_first(text: &str, pattern: &str) -> Option<String> {
     if pattern.is_empty() {
         return None;
     }
-    let re = regex::Regex::new(pattern).ok()?;
+    let re = cached_regex(pattern)?;
     let caps = re.captures(text)?;
     Some(caps
         .get(1)
@@ -2543,7 +2535,7 @@ fn regex_extract_all(text: &str, pattern: &str) -> Vec<String> {
     if pattern.is_empty() {
         return Vec::new();
     }
-    let Ok(re) = regex::Regex::new(pattern) else {
+    let Some(re) = cached_regex(pattern) else {
         return Vec::new();
     };
     re.captures_iter(text)
@@ -3865,9 +3857,8 @@ fn apply_legado_regex(text: &str, regex_part: &str) -> String {
 
 /// Apply regex replacement to first match only
 fn apply_regex_replace_first(text: &str, pattern: &str, replacement: &str) -> String {
-    let re = match regex::Regex::new(pattern) {
-        Ok(r) => r,
-        Err(_) => return text.to_string(),
+    let Some(re) = cached_regex(pattern) else {
+        return text.to_string();
     };
     re.replace(text, replacement).to_string()
 }
@@ -5069,6 +5060,74 @@ mod tests {
         // source.getKey() 丢失时这里会变成 "/0.html" 之类的相对地址。
         assert_eq!(out[0].url, "https://c.example.test/0.html", "并发线程必须拿到书源上下文");
         assert_eq!(out[0].title, "第0章");
+    }
+
+    /// 书源在 chapterPages 里一次列出本章全部续页时，必须返回**完整列表**并补绝对 URL。
+    /// 这是「第一版主820」漏页的根因回归：旧实现只取第一个 href。
+    #[test]
+    fn test_next_content_urls_returns_all_pages_resolved() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "多页源".to_string(),
+            book_source_url: "https://s.example.test".to_string(),
+            rule_content: Some(ContentRule {
+                content: Some("div.content@text".to_string()),
+                next_content_url: Some("div.chapterPages a@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"<html><body>
+            <div class="content">正文</div>
+            <div class="chapterPages">
+                <a href="4507_1.html">1</a>
+                <a href="4507_2.html">2</a>
+                <a href="4507_3.html">3</a>
+            </div>
+        </body></html>"#;
+        let base = "https://s.example.test/book/4507.html";
+
+        let urls = engine.next_content_urls(&source, body, base);
+        assert_eq!(
+            urls,
+            vec![
+                "https://s.example.test/book/4507_1.html".to_string(),
+                "https://s.example.test/book/4507_2.html".to_string(),
+                "https://s.example.test/book/4507_3.html".to_string(),
+            ],
+            "必须抓到全部三个分页，而不是只取第一个"
+        );
+        // 单值 wrapper 仍取第一个，兼容既有调用
+        assert_eq!(
+            engine.next_content_url(&source, body, base).as_deref(),
+            Some("https://s.example.test/book/4507_1.html")
+        );
+    }
+
+    /// JS 规则用 `\n` 给出多个续页 URL 时，list 模式要按行拆成列表并过滤空哨兵值。
+    #[test]
+    fn test_next_content_urls_js_multiline_filters_blanks() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "JS多页源".to_string(),
+            book_source_url: "https://s.example.test".to_string(),
+            rule_content: Some(ContentRule {
+                content: Some("div.content@text".to_string()),
+                next_content_url: Some("js:['p1.html','null','p2.html','undefined','', 'p3.html'].join('\\n')".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let urls = engine.next_content_urls(&source, "<div>正文</div>", "https://s.example.test/book/");
+        assert_eq!(
+            urls,
+            vec![
+                "https://s.example.test/book/p1.html".to_string(),
+                "https://s.example.test/book/p2.html".to_string(),
+                "https://s.example.test/book/p3.html".to_string(),
+            ],
+            "按行拆分并过滤 null/undefined/空串"
+        );
     }
 }
 

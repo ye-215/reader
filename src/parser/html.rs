@@ -1,6 +1,6 @@
 use scraper::{ElementRef, Html, Selector};
-use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use crate::parser::rule_analyzer::split_top_level;
 
@@ -700,7 +700,37 @@ fn normalize_ws(text: &str) -> String {
     out.trim_end().to_string()
 }
 
-fn parse_css_selector(selector: &str) -> Option<Selector> {    if let Ok(parsed) = Selector::parse(selector) { return Some(parsed); }
+/// 书源规则里的 CSS 选择器是有限集合，但每个元素、每个字段、每章都会重新
+/// `Selector::parse` 同一个字符串。`Selector: Send + Sync + Clone`（见上方
+/// `document_top_elements` 的 `static BODY: OnceLock<Option<Selector>>`），
+/// 因此按原始选择器字符串全局缓存；`None` 负结果也缓存，避免非法选择器反复 parse。
+const SELECTOR_CACHE_CAP: usize = 512;
+
+fn selector_cache() -> &'static Mutex<HashMap<String, Option<Selector>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Selector>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_selector(selector: &str) -> Option<Selector> {
+    {
+        let cache = selector_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(selector) {
+            return hit.clone();
+        }
+    }
+    let parsed = parse_css_selector_uncached(selector);
+    let mut cache = selector_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SELECTOR_CACHE_CAP && !cache.contains_key(selector) {
+        cache.clear();
+    }
+    cache.insert(selector.to_string(), parsed.clone());
+    parsed
+}
+
+fn parse_css_selector_uncached(selector: &str) -> Option<Selector> {
+    if let Ok(parsed) = Selector::parse(selector) {
+        return Some(parsed);
+    }
     // Jsoup accepts values such as [property=og:novel:book_name] without
     // quotes. Quote these values before handing the selector to scraper.
     static ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -709,12 +739,18 @@ fn parse_css_selector(selector: &str) -> Option<Selector> {    if let Ok(parsed)
     Selector::parse(&normalized).ok()
 }
 
+fn parse_css_selector(selector: &str) -> Option<Selector> {
+    cached_selector(selector)
+}
+
 fn child_elements<'a>(el: ElementRef<'a>) -> Vec<ElementRef<'a>> {
     el.children().filter_map(ElementRef::wrap).collect()
 }
 
 fn select_by_text_doc<'a>(doc: &'a Html, needle: &str) -> Vec<ElementRef<'a>> {
-    let sel = Selector::parse("*").unwrap();
+    let Some(sel) = cached_selector("*") else {
+        return Vec::new();
+    };
     doc.select(&sel)
         .filter(|el| own_text(el).contains(needle))
         .collect()
@@ -725,7 +761,7 @@ fn select_by_text_from_element<'a>(el: ElementRef<'a>, needle: &str) -> Vec<Elem
     if own_text(&el).contains(needle) {
         matches.push(el);
     }
-    if let Ok(sel) = Selector::parse("*") {
+    if let Some(sel) = cached_selector("*") {
         matches.extend(
             el.select(&sel)
                 .filter(|candidate| own_text(candidate).contains(needle)),
@@ -895,7 +931,7 @@ pub fn select_list<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
 /// 完整页面（body 有多个子节点）返回 `None`：那种情况下不存在"当前元素"，
 /// 与 legado 里根 document 没有 `href` 一致，避免凭空返回第一个 div。
 fn fragment_root(doc: &Html) -> Option<ElementRef<'_>> {
-    let body_sel = Selector::parse("body").ok()?;
+    let body_sel = cached_selector("body")?;
     let body = doc.select(&body_sel).next()?;
     let mut children = body.children().filter_map(ElementRef::wrap);
     let first = children.next()?;
@@ -1010,7 +1046,7 @@ fn element_outer_html_without_scripts(el: &ElementRef) -> String {
     if !original.contains("<script") && !original.contains("<style") {
         return original;
     }
-    let Ok(selector) = Selector::parse("script, style") else {
+    let Some(selector) = cached_selector("script, style") else {
         return original;
     };
     let fragment = Html::parse_fragment(&original);
@@ -1603,6 +1639,20 @@ pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_selector_hits_and_caches_invalid_selectors() {
+        let a = cached_selector("div.item a").expect("合法选择器");
+        let b = cached_selector("div.item a").expect("应命中缓存");
+        let doc = Html::parse_document("<div class=item><a href=x>标题</a></div>");
+        assert_eq!(
+            doc.select(&a).next().unwrap().value().name(),
+            doc.select(&b).next().unwrap().value().name(),
+        );
+        // 非法选择器：两次都要返回 None（负结果缓存），不 panic
+        assert!(cached_selector(":::bad").is_none());
+        assert!(cached_selector(":::bad").is_none());
+    }
 
     /// 多级链式(`class.pic.0@tag.img@src`)必须逐级下钻后取末段提取器。
     /// 某书源详情页 `coverUrl` 模板就是这么写的; 早先的 select_all_text 把

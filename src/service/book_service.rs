@@ -623,10 +623,25 @@ pub struct BookService {
     login_sessions: Arc<RwLock<HashMap<String, SourceLoginSession>>>,
     rate_states: Arc<RwLock<HashMap<String, RateState>>>,
     bookshelf_write_lock: Arc<Mutex<()>>,
+    // 书架读缓存: 只放"磁盘真值"(未应用 brc: override 的列表)。
+    // brc: 由书源 JS 写入且不动 bookshelf.json, 若在缓存里固化 override,
+    // setUseReplaceRule 改了就不会生效 —— 所以命中时每次重算 override。
+    // 写路径统一经 write_bookshelf 失效; TTL/CAP 兜底多实例与外部改文件。
+    bookshelf_cache: Arc<RwLock<HashMap<String, CachedShelf>>>,
     // 缓存清单是单个 JSON 文件，读改写必须按书串行。批量任务与
     // 概览重建可能并发落到同一本书，没有这把锁时后写者会用旧快照覆盖前者。
     cache_manifest_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
 }
+
+#[derive(Clone)]
+struct CachedShelf {
+    books: Vec<Book>,
+    saved_at: Instant,
+}
+
+/// 书架读缓存的兜底 TTL: 覆盖多实例/外部直接改 bookshelf.json 的情形。
+const SHELF_CACHE_TTL: Duration = Duration::from_secs(30);
+const SHELF_CACHE_CAP: usize = 64;
 
 #[derive(Clone, Default)]
 struct RateState {
@@ -855,6 +870,7 @@ impl BookService {
             login_sessions: Arc::new(RwLock::new(HashMap::new())),
             rate_states: Arc::new(RwLock::new(HashMap::new())),
             bookshelf_write_lock: Arc::new(Mutex::new(())),
+            bookshelf_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_manifest_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -2034,7 +2050,7 @@ impl BookService {
                     .await?;
                 let (content, js_logs) =
                     self.parse_content_blocking(user_ns, source, &res, url, url, None).await?;
-                let next = self.source_scope(user_ns, source, || self.parser.next_content_url(source, &res.body, &res.url))?;
+                let next = self.source_scope(user_ns, source, || self.parser.next_content_urls(source, &res.body, &res.url))?;
                 Ok(debug_trace_from(
                     &res,
                     serde_json::json!({
@@ -2642,14 +2658,18 @@ impl BookService {
 
         let mut all_content = String::new();
         let mut visited_urls = std::collections::HashSet::new();
-        let mut current_url = chapter_url.to_string();
+        // 正文续页用队列而非单链：书源的 nextContentUrl 可能一次列出本章全部页码
+        // (如 `4507_1/_2/_3`)。按 legado 语义应全部抓完。VecDeque 保持 DOM 给出的
+        // 顺序(通常是页码升序)，visited 去重让重复列举的页码和环自动收敛。
+        let mut pending: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from([chapter_url.to_string()]);
         let book_ctx = self.js_book_context(user_ns, book_url, chapter_url).await;
 
         // Follow pagination to get all content pages
-        loop {
+        while let Some(current_url) = pending.pop_front() {
             if visited_urls.contains(&current_url) {
-                tracing::debug!("get_content detected loop, breaking");
-                break;
+                tracing::debug!("get_content detected loop, skipping: {}", current_url);
+                continue;
             }
             visited_urls.insert(current_url.clone());
 
@@ -2686,20 +2706,20 @@ impl BookService {
                 all_content.push_str(&content);
             }
 
-            // Check for next page
-            if let Some(next_url) = self.source_scope(user_ns, source, || {
-                self.parser.next_content_url(source, &res.body, &res.url)
-            })? {
-                tracing::debug!("get_content found next_url: {}", next_url);
+            // Check for next pages — 可能一次返回多个续页 URL
+            let next_urls = self.source_scope(user_ns, source, || {
+                self.parser.next_content_urls(source, &res.body, &res.url)
+            })?;
+            for next_url in next_urls {
                 if should_follow_content_page(chapter_url, &current_url, &next_url) {
-                    current_url = next_url;
+                    if !visited_urls.contains(&next_url) && !pending.contains(&next_url) {
+                        tracing::debug!("get_content queued next page: {}", next_url);
+                        pending.push_back(next_url);
+                    }
                 } else {
-                    tracing::debug!("get_content next_url appears to be next chapter, stopping");
-                    break;
+                    // 该候选是下一章而非续页：跳过它，但继续处理队列里已入队的其它续页
+                    tracing::debug!("get_content next_url appears to be next chapter, skipping: {}", next_url);
                 }
-            } else {
-                tracing::debug!("get_content no more pages");
-                break;
             }
         }
 
@@ -4524,6 +4544,22 @@ impl BookService {
     }
 
     async fn read_bookshelf(&self, user_ns: &str) -> Result<Vec<Book>, AppError> {
+        // 读缓存: 命中即 clone 一份, 再叠加 brc: override 后返回。
+        // 只缓存"磁盘真值"(未应用 override), override 每次读时重算 —— JS 侧
+        // setUseReplaceRule 改了 brc: 键却不动 bookshelf.json, 固化进缓存会失效。
+        let cached = {
+            let cache = self.bookshelf_cache.read().await;
+            cache
+                .get(user_ns)
+                .filter(|entry| entry.saved_at.elapsed() < SHELF_CACHE_TTL)
+                .map(|entry| entry.books.clone())
+        };
+        if let Some(mut list) = cached {
+            let snapshot = crate::parser::js::book_read_config_overrides_snapshot();
+            apply_book_read_config_overrides(&mut list, &snapshot);
+            return Ok(list);
+        }
+
         let path = self.bookshelf_path(user_ns);
         if !path.exists() {
             return Ok(Vec::new());
@@ -4542,14 +4578,31 @@ impl BookService {
                     path.display(),
                     recovered.len()
                 );
+                // 自愈回写会失效缓存, 所以填缓存必须在这之后。
                 self.write_bookshelf(user_ns, &recovered).await?;
                 recovered
             }
         };
         for book in &mut list {
             sanitize_book_urls(book);
-            apply_book_read_config_override(book);
         }
+        // 填入真值缓存。写路径持 bookshelf_write_lock, 这里用独立的 cache 锁,
+        // 锁序固定为 write_lock -> cache, 与 write_bookshelf 内的失效保持一致。
+        {
+            let mut cache = self.bookshelf_cache.write().await;
+            if cache.len() >= SHELF_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(
+                user_ns.to_string(),
+                CachedShelf {
+                    books: list.clone(),
+                    saved_at: Instant::now(),
+                },
+            );
+        }
+        let snapshot = crate::parser::js::book_read_config_overrides_snapshot();
+        apply_book_read_config_overrides(&mut list, &snapshot);
         Ok(list)
     }
 
@@ -4579,7 +4632,12 @@ impl BookService {
         let mut last_error = None;
         for attempt in 0..5u32 {
             match fs::rename(&temp_path, &path).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // 唯一的缓存失效点: 所有 9 处书架写都汇聚到这里, 且调用方
+                    // 都持有 bookshelf_write_lock。锁序 write_lock -> cache 固定。
+                    self.bookshelf_cache.write().await.remove(user_ns);
+                    return Ok(());
+                }
                 Err(error) => {
                     last_error = Some(error);
                     if attempt < 4 {
@@ -5131,11 +5189,17 @@ fn strip_page_suffix_from_stem(stem: &str) -> &str {
     for sep in ['-', '_'] {
         if let Some(idx) = stem.rfind(sep) {
             let suffix = &stem[idx + sep.len_utf8()..];
+            // 页码从 1 起算：很多站点（如 zzbook 的 `{章ID}_1.html`）把
+            // **第一张续页**编号为 `_1`，主章才是无后缀的 `4507.html`。
+            // 旧实现要求 `>= 2`，于是 `4507_1.html` 被当成“另一章”过滤掉，
+            // 表现为每章都只显示主章、续页全丢（“每章不完整”）。
+            // 下一章判断仍由书源自己的 nextContentUrl 规则负责，这里放宽
+            // 不会把真正的下一章误并进来（章节号不同 → 去掉后缀后也不等）。
             if !suffix.is_empty()
                 && suffix.chars().all(|ch| ch.is_ascii_digit())
                 && suffix
                     .parse::<usize>()
-                    .map(|page| page >= 2)
+                    .map(|page| page >= 1)
                     .unwrap_or(false)
             {
                 return &stem[..idx];
@@ -5277,6 +5341,32 @@ fn apply_book_read_config_override(book: &mut Book) {
         .and_then(|config| config.get("useReplaceRule").and_then(serde_json::Value::as_bool))
     {
         book.read_config.get_or_insert_with(Default::default).use_replace_rule = Some(use_replace_rule);
+    }
+}
+
+/// 与 `apply_book_read_config_override` 等价, 但对整表只锁一次 JS_STORE。
+///
+/// `snapshot` 的 key 是去掉 `brc:` 前缀的 `{source}:{bookUrl}`, 拼法与
+/// `book_read_config_override` 内部一致(normalize + trim_end_matches('/'))。
+fn apply_book_read_config_overrides(books: &mut [Book], snapshot: &HashMap<String, String>) {
+    if snapshot.is_empty() {
+        return;
+    }
+    for book in books {
+        if book.book_url.trim().is_empty() {
+            continue;
+        }
+        let source = normalize_source_url(&book.origin);
+        let source = source.trim_end_matches('/');
+        let key = format!("{}:{}", source, book.book_url);
+        if let Some(value) = snapshot.get(&key) {
+            let use_replace_rule = match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => continue,
+            };
+            book.read_config.get_or_insert_with(Default::default).use_replace_rule = Some(use_replace_rule);
+        }
     }
 }
 
@@ -5622,6 +5712,24 @@ async fn collect_referenced_cover_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// zzbook 类站点：`4507.html` 是主章，`4507_1.html` / `4507_2.html` 是续页。
+    /// 续页从 `_1` 起算，若页码判断要求 `>= 2`，第一续页会被误判成“下一章”
+    /// 而丢弃，症状是每章正文都缺一段。
+    #[test]
+    fn content_pagination_accepts_page_one_suffix() {
+        let chapter = "https://www.zzbook.net/go/1/123/4507.html";
+        let page1 = "https://www.zzbook.net/go/1/123/4507_1.html";
+        let page2 = "https://www.zzbook.net/go/1/123/4507_2.html";
+        let next_chapter = "https://www.zzbook.net/go/1/123/4508.html";
+
+        assert!(should_follow_content_page(chapter, chapter, page1));
+        assert!(should_follow_content_page(chapter, page1, page2));
+        // 真正的下一章仍要拒绝，不能被当成续页并进本章
+        assert!(!should_follow_content_page(chapter, page2, next_chapter));
+        // 书源“无续页”哨兵值也要拒绝
+        assert!(!should_follow_content_page(chapter, chapter, "javascript:;"));
+    }
 
     /// 阶段枚举的序列化结果就是前端 `loadStage` 收到的字符串,
     /// 改动这里会直接破坏阅读页的阶段文案, 所以固定住。
@@ -7749,5 +7857,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    fn shelf_test_service(storage_dir: &std::path::Path) -> BookService {
+        BookService::new(
+            HttpClient::new(15, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        )
+    }
+
+    fn shelf_test_book(name: &str, url: &str) -> Book {
+        Book {
+            name: name.to_string(),
+            author: "作者".to_string(),
+            origin: "https://source.example".to_string(),
+            book_url: url.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 方案 D 的核心一致性保证: 任何写路径写盘后, 再次读取必须反映新值,
+    /// 不能因为读缓存而返回旧快照。这里直接改磁盘文件模拟"写入已完成",
+    /// 验证 write_bookshelf 的失效钩子确实生效。
+    #[tokio::test]
+    async fn bookshelf_read_reflects_disk_after_write_invalidation() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-shelf-invalidate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = shelf_test_service(&storage_dir);
+        let url = "https://book.example/1";
+        service.save_book("default", shelf_test_book("第一版", url)).await.unwrap();
+        // 首次读填充缓存。
+        assert_eq!(service.get_bookshelf("default").await.unwrap()[0].name, "第一版");
+
+        // 第二次 save 会经 write_bookshelf 失效缓存, 再读必须拿到新值。
+        service.save_book("default", shelf_test_book("第二版", url)).await.unwrap();
+        assert_eq!(service.get_bookshelf("default").await.unwrap()[0].name, "第二版");
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 缓存命中路径: 首读填充后删除磁盘文件, TTL 内再读仍成功(证明没读盘),
+    /// 且返回的是克隆, 调用方修改不会污染缓存。
+    #[tokio::test]
+    async fn bookshelf_cache_hit_avoids_disk_and_returns_clone() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-shelf-hit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = shelf_test_service(&storage_dir);
+        let url = "https://book.example/2";
+        service.save_book("default", shelf_test_book("缓存测试", url)).await.unwrap();
+        assert_eq!(service.get_bookshelf("default").await.unwrap().len(), 1);
+        // save_book 走 write_bookshelf 会失效缓存, 所以先读一次重新填充。
+        let _ = service.get_bookshelf("default").await.unwrap();
+
+        let path = service.bookshelf_path("default");
+        std::fs::remove_file(&path).unwrap();
+        let mut from_cache = service.get_bookshelf("default").await.unwrap();
+        assert_eq!(from_cache.len(), 1, "缓存命中时不应重新读盘");
+        from_cache[0].name = "被调用方改坏".to_string();
+        // 再次读仍应是原始值(缓存未被 clone 的修改污染)。
+        assert_eq!(service.get_bookshelf("default").await.unwrap()[0].name, "缓存测试");
+
+        let _ = std::fs::remove_dir_all(storage_dir);
+    }
+
+    /// 方案 A 的批量 override: 与逐本版本语义一致, 且 key 拼法(含 `:` 的 URL)正确。
+    #[test]
+    fn batch_override_applies_use_replace_rule() {
+        let mut books = vec![
+            shelf_test_book("A", "https://book.example/a"),
+            shelf_test_book("B", "https://book.example/b"),
+        ];
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "https://source.example:https://book.example/a".to_string(),
+            "true".to_string(),
+        );
+        snapshot.insert(
+            // 非法值应被忽略, 不能写成 Some
+            "https://source.example:https://book.example/b".to_string(),
+            "garbage".to_string(),
+        );
+        apply_book_read_config_overrides(&mut books, &snapshot);
+
+        let cfg_a = books[0].read_config.as_ref().unwrap();
+        assert_eq!(cfg_a.use_replace_rule, Some(true));
+        assert!(books[1].read_config.is_none(), "非法 override 值不应创建 read_config");
     }
 }

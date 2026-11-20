@@ -1,11 +1,45 @@
 use regex::Regex;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// 书源规则里的正则 pattern 是有限集合（书源数量 × 规则数），但正文/字段解析
+/// 会在逐字段、逐元素、逐章节的最内层循环里反复编译同一个 pattern。这里按
+/// pattern 字符串全局缓存编译结果，`None` 表示编译失败（同样缓存，避免非法
+/// 正则反复尝试）。容量上限防止异常书源不断喂新 pattern 导致无界增长。
+const REGEX_CACHE_CAP: usize = 512;
+
+fn regex_cache() -> &'static Mutex<HashMap<String, Option<Regex>>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, Option<Regex>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取一个已编译的正则；`None` 表示 pattern 非法。
+/// 缓存命中只加一次短锁并 clone `Arc` 级别的引用计数——`Regex` 内部本身是
+/// `Arc`，clone 很廉价。
+pub fn cached_regex(pattern: &str) -> Option<Regex> {
+    {
+        let cache = regex_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(pattern) {
+            return hit.clone();
+        }
+    }
+    // 编译放在锁外：慢操作不阻塞其它 pattern 的查询。
+    let compiled = Regex::new(pattern).ok();
+    let mut cache = regex_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= REGEX_CACHE_CAP && !cache.contains_key(pattern) {
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), compiled.clone());
+    compiled
+}
 
 pub fn strip_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn apply_regex_replace(input: &str, pattern: &str, replace: &str) -> String {
-    if let Ok(re) = Regex::new(pattern) {
+    if let Some(re) = cached_regex(pattern) {
         re.replace_all(input, replace).to_string()
     } else {
         input.to_string()
@@ -96,9 +130,11 @@ pub fn repair_encoded_url(input: &str) -> String {
     if !(normalized.contains("%3F")
         || normalized.contains("%3f")
         || normalized.contains("%26")
-        || normalized.contains("%26")
         || normalized.contains("%3D")
-        || normalized.contains("%3d"))
+        || normalized.contains("%3d")
+        // 守卫原先漏了 %23：只有 URL 里同时出现 %3F/%26/%3D 时，
+        // 结尾那次 %23 → # 才会执行；单独的 `%23` 永远修不好。
+        || normalized.contains("%23"))
     {
         return normalized;
     }
@@ -110,12 +146,42 @@ pub fn repair_encoded_url(input: &str) -> String {
         .replace("%3D", "=")
         .replace("%3d", "=")
         .replace("%23", "#")
-        .replace("%23", "#")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::visible_char_count;
+    use super::{cached_regex, repair_encoded_url, visible_char_count};
+
+    #[test]
+    fn cached_regex_hits_and_caches_invalid_patterns() {
+        let a = cached_regex("[A-Z]+").expect("合法正则");
+        let b = cached_regex("[A-Z]+").expect("合法正则应命中缓存");
+        assert_eq!(a.replace_all("ab CD", ""), b.replace_all("ab CD", ""));
+        // 非法 pattern 也要返回 None，且第二次同样（走负结果缓存）
+        assert!(cached_regex("([").is_none());
+        assert!(cached_regex("([").is_none());
+        assert_eq!(a.find("xxAByy").unwrap().as_str(), "AB");
+    }
+
+    #[test]
+    fn repairs_hash_only_url() {
+        // 单独出现 %23 时也必须还原：守卫曾漏掉这一项，导致锚点参数（如
+        // /chapter/1%23footnote）一直是字面 %23，站点锚点定位与分流失效。
+        assert_eq!(
+            repair_encoded_url("https://example.test/book/1%23footnote"),
+            "https://example.test/book/1#footnote"
+        );
+        // 混合编码仍要全部还原，且每个只替换一次。
+        assert_eq!(
+            repair_encoded_url("https://example.test/s%3Fx%3D1%26y%3D2%23top"),
+            "https://example.test/s?x=1&y=2#top"
+        );
+        // 没有编码时不改动。
+        assert_eq!(
+            repair_encoded_url("https://example.test/book/1"),
+            "https://example.test/book/1"
+        );
+    }
 
     #[test]
     fn counts_plain_text_without_whitespace() {

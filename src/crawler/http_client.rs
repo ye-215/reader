@@ -2,8 +2,14 @@ use reqwest::{Client, NoProxy, Proxy};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use url::Url;
+use std::collections::VecDeque;
 use std::{collections::HashMap, path::PathBuf};
 use super::source_session::{SourceHttpContext, SourceSession};
+
+/// 每个书源(+用户空间)一个 session 与若干 client。长期运行里反复切源/换代理会
+/// 让这两张 map 一直堆积；cookie 每次写入都落盘、client 无状态，重建代价很小，
+/// 因此按 LRU 淘汰最久未用的键，上限内保留活跃书源。
+const SOURCE_SESSION_CAP: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyMode {
@@ -24,6 +30,8 @@ pub struct HttpClient {
     timeout_secs: u64,
     source_sessions: Arc<RwLock<HashMap<String, Arc<SourceSession>>>>,
     source_clients: Arc<RwLock<HashMap<String, Client>>>,
+    /// 最近使用顺序（队首最旧、队尾最新），键为 `{user_ns}::{source_url}`。
+    source_lru: Arc<RwLock<VecDeque<String>>>,
     source_storage_dir: Arc<RwLock<Option<PathBuf>>>,
 }
 
@@ -40,6 +48,7 @@ impl HttpClient {
             timeout_secs,
             source_sessions: Arc::default(),
             source_clients: Arc::default(),
+            source_lru: Arc::default(),
             source_storage_dir: Arc::default(),
         })
     }
@@ -91,6 +100,34 @@ impl HttpClient {
                 Arc::new(SourceSession::new(user_ns, &source_url, root.as_deref()))
             }).clone()
         };
+        // LRU 记账：把当前键移到队尾。cookie 已落盘、client 无状态，超限淘汰最旧
+        // 的键不会丢登录态。按顺序加锁并在每次 write 的作用域结束后立即释放，
+        // 避免与其它路径（set_proxy / reset_cookie_jar）交叉持锁造成死锁。
+        {
+            let mut lru = self.source_lru.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = lru.iter().position(|k| k == &key) {
+                lru.remove(pos);
+            }
+            lru.push_back(key.clone());
+            while lru.len() > SOURCE_SESSION_CAP {
+                let Some(evict_key) = lru.pop_front() else { break };
+                // 不能淘汰刚刚 touch 的键（CAP 极小或并发下理论上可能）
+                if evict_key == key {
+                    lru.push_back(evict_key);
+                    break;
+                }
+                self.source_sessions
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&evict_key);
+                // 该键下所有 client（含 no-redirect 变体）一并清掉
+                let prefix = format!("{evict_key}::");
+                self.source_clients
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|k, _| !k.starts_with(&prefix));
+            }
+        }
         let client_key = format!("{key}::proxy={}", proxy.as_deref().unwrap_or(""));
         let mut clients = self.source_clients.write().unwrap_or_else(|e| e.into_inner());
         let client = match clients.get(&client_key) {

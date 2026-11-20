@@ -1,6 +1,6 @@
 [package]
 name = "reader-rust"
-version = "1.6.7"
+version = "1.6.8-beta.1"
 edition = "2021"
 
 # The desktop app is a workspace member so it shares this target/ directory, but
@@ -9,6 +9,13 @@ edition = "2021"
 [workspace]
 members = ["desktop/src-tauri"]
 default-members = ["."]
+
+# 发布增量编译：只改了 reader-rust 里某个 crate 时，复用上次编译缓存，
+# 避免每次打包都对本 crate 全量 codegen。代价是二进制略大、运行时约慢 1-2%，
+# 对反复出测试包完全值得。正式发布可用环境变量覆盖为关闭：
+#   CARGO_PROFILE_RELEASE_INCREMENTAL=false npm run build
+[profile.release]
+incremental = true
 
 [dependencies]
 tauri = { version = "2" }

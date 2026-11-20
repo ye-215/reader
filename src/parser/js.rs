@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -71,13 +71,23 @@ const JS_KV_CAP: usize = 2048;
 const JS_KV_MAX_VALUE_BYTES: usize = 1024 * 1024;
 /// 持久 KV: `cache.put`、`source/book/chapter.putVariable` 等, 落盘到 `{storage}/js_store.json`。
 static JS_STORE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(load_js_store()));
+/// 持久变量无上限时，失控书源反复写不同 key 会让 js_store.json 与进程内存一起膨胀。
+/// 超限后按 key 排序确定性淘汰（极端场景才触发，优先保住可用内存）。
+const JS_STORE_CAP: usize = 4096;
+const JS_STORE_MAX_VALUE_BYTES: usize = 1024 * 1024;
 static JS_STORAGE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static JS_DEFAULT_HTTP: OnceLock<HttpClient> = OnceLock::new();
 static JS_FALLBACK_HTTP: Lazy<HttpClient> = Lazy::new(|| HttpClient::new(30, None).expect("JS HTTP client"));
 static JS_HTTP_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("JS HTTP runtime"));
-/// 组装好的 jsLib 源码, 按 jsLib 文本 md5 缓存; `Some(Instant)` 表示含下载失败项, 到期后重试。
-static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, (String, Option<Instant>)>>> =
+/// 组装好的 jsLib 源码, 按 jsLib 文本 md5 缓存。value = (源码, 源码md5, 重试时间)：
+/// 源码用 `Arc` 使命中时 O(1) 复制而非每次 clone 整串（可能数百 KB）；
+/// 源码 md5 一并缓存，消除每次 eval 对整串的重复哈希；`Some(Instant)` 表示含
+/// 下载失败项，到期后重试。
+static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, (Arc<String>, String, Option<Instant>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// 键是 jsLib 文本 md5，正常规模等于「书源数」；设上限防止异常脚本不断喂新文本
+/// 时无限增长。超限直接清空（纯派生缓存，重算即可，不丢任何用户数据）。
+const JS_LIB_CACHE_CAP: usize = 128;
 const JS_LIB_RETRY_AFTER: Duration = Duration::from_secs(60);
 // Signature helpers can nest JS and Rust crypto calls beyond QuickJS's 256 KiB
 // default. Keep the limit below the native worker thread's stack allocation.
@@ -410,9 +420,41 @@ pub fn book_read_config_override(source_url: &str, book_url: &str) -> Option<Jso
     }
 }
 
+/// 一次锁定 JS_STORE, 取出全部 `brc:` 覆盖项, 供书架整表读取时复用。
+///
+/// 书架有几百本书时, 逐本调用 `book_read_config_override` 会对 JS_STORE 加锁几百次;
+/// 这里把 N 次锁合并为 1 次。返回 map 的 key 是去掉 `brc:` 前缀的完整 `{source}:{bookUrl}`
+/// 字符串, 由调用方用与单行版本完全相同的拼法查询 —— 避免在 `:` 上 split 造成歧义
+/// (source 与 bookUrl 都可能含 `:`)。value 为原始 "true"/"false" 字符串。
+pub fn book_read_config_overrides_snapshot() -> HashMap<String, String> {
+    JS_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(key, value)| {
+            let body = key.strip_prefix("brc:")?;
+            Some((body.to_string(), value.clone()))
+        })
+        .collect()
+}
+
+/// 持久变量的无界增长防护：先丢超大值，再按 key 排序裁到上限。
+/// 用排序而非随机 removal，保证同一份数据在何时何地裁剪结果一致。
+fn enforce_store_limits(map: &mut HashMap<String, String>) {
+    map.retain(|_, value| value.len() <= JS_STORE_MAX_VALUE_BYTES);
+    if map.len() > JS_STORE_CAP {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort_unstable();
+        for key in keys.into_iter().skip(JS_STORE_CAP) {
+            map.remove(&key);
+        }
+    }
+}
+
 fn store_write(update: impl FnOnce(&mut HashMap<String, String>)) {
     let mut map = JS_STORE.lock().unwrap_or_else(|e| e.into_inner());
     update(&mut map);
+    enforce_store_limits(&mut map);
     let Some(dir) = JS_STORAGE_DIR.get() else {
         return;
     };
@@ -2778,7 +2820,7 @@ fn eval_js_inner_with_source(
     // `decrypt` 走原始字节分支（见 `eval_js_cover_decode`）。
     binary_input: Option<&[u8]>,
 ) -> anyhow::Result<String> {
-    let shared_js = active_js_lib_script();
+    let (shared_js, shared_js_md5) = active_js_lib_script();
     let source_info = active_source();
     let source_url = source_info
         .url
@@ -2807,8 +2849,8 @@ fn eval_js_inner_with_source(
     // 复用键必须带上书源: 不同书源(尤其都没有 jsLib 时)不能共用同一个上下文,
     // 否则规则脚本声明的全局变量会互相可见。同一书源的连续章节仍能命中复用。
     let identity = source_info.http.as_ref().map(|http| http.session.identity.as_str()).unwrap_or(&source_info.url);
-    let lib_key = format!("{}\u{1}{}", identity, md5_hex(&shared_js));
-    with_reusable_context(&lib_key, &shared_js, |ctx, initialize| {
+    let lib_key = format!("{}\u{1}{}", identity, shared_js_md5);
+    with_reusable_context(&lib_key, shared_js.as_str(), |ctx, initialize| {
         let globals = ctx.globals();
         let input_value = input.unwrap_or("");
         let base_url_value = base_url.unwrap_or("");
@@ -4605,30 +4647,44 @@ fn bare_destructuring_param_open(out: &[char]) -> Option<usize> {
     Some(open_idx)
 }
 
-fn active_js_lib_script() -> String {
-    let js_lib = ACTIVE_JS_LIB.with(|cell| cell.borrow().clone());
-    let Some(js_lib) = js_lib.filter(|value| !value.trim().is_empty()) else {
-        return String::new();
+/// 返回 (组装好的 jsLib 源码, 该源码的 md5)。源码用 `Arc` 承载，每次 eval 只
+/// 增引用计数，不再 clone 整串；md5 在此算好，调用方无需再对整串重复哈希。
+fn active_js_lib_script() -> (Arc<String>, String) {
+    // 直接对借用串计算，不在命中前 clone 原始 jsLib。
+    let cache_key = ACTIVE_JS_LIB.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(md5_hex)
+    });
+    let Some(cache_key) = cache_key else {
+        return (Arc::new(String::new()), md5_hex(""));
     };
-    let cache_key = md5_hex(&js_lib);
-    if let Some((cached, retry_at)) = JS_LIB_CACHE
+
+    if let Some((cached_src, cached_md5, retry_at)) = JS_LIB_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&cache_key)
         .cloned()
     {
         if retry_at.map_or(true, |at| Instant::now() < at) {
-            return cached;
+            return (cached_src, cached_md5);
         }
     }
 
+    let js_lib = ACTIVE_JS_LIB.with(|cell| cell.borrow().clone()).unwrap_or_default();
     let (compiled, complete) = compile_js_lib(&js_lib);
+    let compiled_md5 = md5_hex(&compiled);
     let retry_at = (!complete).then(|| Instant::now() + JS_LIB_RETRY_AFTER);
-    JS_LIB_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(cache_key, (compiled.clone(), retry_at));
-    compiled
+    let compiled = Arc::new(compiled);
+    {
+        let mut cache = JS_LIB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= JS_LIB_CACHE_CAP && !cache.contains_key(&cache_key) {
+            cache.clear();
+        }
+        cache.insert(cache_key, (compiled.clone(), compiled_md5.clone(), retry_at));
+    }
+    (compiled, compiled_md5)
 }
 
 /// 组装 jsLib。JSON 对象形式 `{"name": "https://...js"}` 按 legado 逐个下载 URL 值;
@@ -5681,6 +5737,27 @@ pub fn panel_digest(payload: &JsonValue) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 持久变量超限后：超大值被丢弃，条目数裁到上限且保留字典序靠前的键。
+    #[test]
+    fn store_limits_drop_oversize_values_and_excess_keys() {
+        let mut map = HashMap::new();
+        map.insert("keep".into(), "ok".into());
+        map.insert("big".into(), "x".repeat(super::JS_STORE_MAX_VALUE_BYTES + 1));
+        super::enforce_store_limits(&mut map);
+        assert_eq!(map.get("keep").map(String::as_str), Some("ok"));
+        assert!(!map.contains_key("big"), "超大值必须被丢弃");
+
+        // 造 CAP+2 个键，裁剪后应只剩 CAP 个，且字典序最大的两个被移除。
+        let mut map = HashMap::new();
+        for i in 0..super::JS_STORE_CAP + 2 {
+            map.insert(format!("k{i:05}"), "v".into());
+        }
+        super::enforce_store_limits(&mut map);
+        assert_eq!(map.len(), super::JS_STORE_CAP);
+        assert!(map.contains_key("k00000"));
+        assert!(!map.contains_key(&format!("k{:05}", super::JS_STORE_CAP + 1)));
+    }
 
     /// AES-GCM 必须与标准实现逐字节一致（NIST SP 800-38D 测试向量）。
     ///

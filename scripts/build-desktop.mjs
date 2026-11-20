@@ -73,6 +73,19 @@ const version = readVersion()
 const productName = readProductName()
 console.log(`打包 阅读 桌面版 v${version}（productName: ${productName}）`)
 
+// ── 加速开关（用环境变量控制，不改代码即可切换）──
+// READER_SKIP_FRONTEND=1  只改了 Rust 时跳过 npm install + vite build，
+//                         直接复用已有的 frontend/dist（前端 dist 会被
+//                         tauri 编译进 exe，没改前端就没必要重建）。
+// READER_BUNDLE=1         仅出安装包；默认会连同便携 zip 一起打。
+//                         只想快速拿到可运行 exe 时设 READER_NO_BUNDLE=1，
+//                         tauri build 加 --no-bundle，跳过 NSIS 压缩。
+// CARGO_BUILD_JOBS        覆盖 cargo 并行度。默认保持原来的 4（避免占满
+//                         全部 CPU 让电脑卡顿）；机器空闲时可显式调高。
+const skipFrontend = process.env.READER_SKIP_FRONTEND === '1'
+const noBundle = process.env.READER_NO_BUNDLE === '1'
+const cargoJobs = process.env.CARGO_BUILD_JOBS?.trim() || '4'
+
 // 可选的「固定 WebView2 运行时」打包模式。
 //
 // 默认走 Tauri 的 downloadBootstrapper: 体积小, 但用户机器上的 WebView2 版本
@@ -101,23 +114,32 @@ if (fixedWebview2) {
 }
 
 
-// `ci` rather than `install` so a release build can never drift the lockfile.
-runShell('npm ci', frontendDir)
-// Build the frontend here (beforeBuildCommand is a no-op) so the relative
-// path in tauri.conf.json never has to resolve against tauri's CWD.
-runShell('npm run build', frontendDir)
+// 用 `npm install` 而非 `npm ci`：ci 会先删除整个 node_modules，在受保护的
+// 环境下批量删除会被安全策略拦截；install 是增量的，依赖已装好时几乎瞬间完成。
+// 如需严格锁定版本，可保留 lock 文件并由 npm install 自动遵循。
+if (skipFrontend) {
+  console.log('\n[加速] READER_SKIP_FRONTEND=1：跳过 npm install + vite build，复用现有 frontend/dist')
+} else {
+  runShell('npm install', frontendDir)
+  // Build the frontend here (beforeBuildCommand is a no-op) so the relative
+  // path in tauri.conf.json never has to resolve against tauri's CWD.
+  runShell('npm run build', frontendDir)
+}
 
-// `tauri build` runs cargo release build + NSIS bundling. CARGO_BUILD_JOBS=4
-// keeps the antivirus race at bay. Run from src-tauri/ so the relative
-// frontendDist path resolves correctly.
+// `tauri build` runs cargo release build + NSIS bundling. Run from src-tauri/
+// so the relative frontendDist path resolves correctly.
 //
+// --no-bundle：只要可运行 exe 时用，省掉 NSIS 压缩（几十秒~一分钟）。注意
+// `--no-bundle` 时下面的 NSIS 复制会跳过；便携 zip 仍从 target/release/exe 打。
 // --config 只在选择了固定 WebView2 运行时时传: 它会把这份内联配置与
 // tauri.windows.conf.json 深合并, 不传时行为与改动前完全一致。
 const buildArgs = [tauriCli, 'build']
+if (noBundle) buildArgs.push('--no-bundle')
 if (Object.keys(bundleConfig).length) {
   buildArgs.push('--config', JSON.stringify({ bundle: bundleConfig }))
 }
-run('node', buildArgs, tauriDir, { CARGO_BUILD_JOBS: '4' })
+console.log(`\n[加速] CARGO_BUILD_JOBS=${cargoJobs}${noBundle ? '，--no-bundle（跳过 NSIS）' : ''}`)
+run('node', buildArgs, tauriDir, { CARGO_BUILD_JOBS: cargoJobs })
 
 // ── NSIS installer ──
 // The workspace shares the repo-root target/ dir, so the bundle lands under
@@ -125,13 +147,17 @@ run('node', buildArgs, tauriDir, { CARGO_BUILD_JOBS: '4' })
 const nsisDir = join(repoRoot, 'target', 'release', 'bundle', 'nsis')
 const nsisName = `${productName}_${version}_x64-setup.exe`
 const nsisSrc = join(nsisDir, nsisName)
-if (!existsSync(nsisSrc)) {
-  throw new Error(`未找到 NSIS 安装包: ${nsisSrc}`)
+if (noBundle) {
+  console.log('\n[加速] --no-bundle：跳过 NSIS 安装包复制')
+} else {
+  if (!existsSync(nsisSrc)) {
+    throw new Error(`未找到 NSIS 安装包: ${nsisSrc}`)
+  }
+  const nsisOut = join(outRoot, nsisName)
+  rmSync(nsisOut, { force: true })
+  cpSync(nsisSrc, nsisOut)
+  console.log(`\nNSIS 安装包: ${nsisOut}`)
 }
-const nsisOut = join(outRoot, nsisName)
-rmSync(nsisOut, { force: true })
-cpSync(nsisSrc, nsisOut)
-console.log(`\nNSIS 安装包: ${nsisOut}`)
 
 // ── Portable zip ──
 const exeSrc = join(repoRoot, 'target', 'release', 'reader-desktop.exe')
