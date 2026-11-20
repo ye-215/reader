@@ -147,13 +147,13 @@ run('node', buildArgs, tauriDir, { CARGO_BUILD_JOBS: cargoJobs })
 const nsisDir = join(repoRoot, 'target', 'release', 'bundle', 'nsis')
 const nsisName = `${productName}_${version}_x64-setup.exe`
 const nsisSrc = join(nsisDir, nsisName)
+const nsisOut = join(outRoot, nsisName)
 if (noBundle) {
   console.log('\n[加速] --no-bundle：跳过 NSIS 安装包复制')
 } else {
   if (!existsSync(nsisSrc)) {
     throw new Error(`未找到 NSIS 安装包: ${nsisSrc}`)
   }
-  const nsisOut = join(outRoot, nsisName)
   rmSync(nsisOut, { force: true })
   cpSync(nsisSrc, nsisOut)
   console.log(`\nNSIS 安装包: ${nsisOut}`)
@@ -176,4 +176,4 @@ const zipPath = join(outRoot, `reader-portable-v${version}-win-x64.zip`)
 rmSync(zipPath, { force: true })
 run('tar.exe', ['-a', '-c', '-f', zipPath, '-C', stageDir, '.'])
 
-console.log(`\n完成:\n  安装包 ${nsisOut}\n  压缩包 ${zipPath}`)
+console.log(`\n完成:\n  安装包 ${noBundle ? '(本次 --no-bundle 已跳过)' : nsisOut}\n  压缩包 ${zipPath}`)
