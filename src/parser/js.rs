@@ -92,6 +92,73 @@ const JS_LIB_RETRY_AFTER: Duration = Duration::from_secs(60);
 // Signature helpers can nest JS and Rust crypto calls beyond QuickJS's 256 KiB
 // default. Keep the limit below the native worker thread's stack allocation.
 const JS_MAX_STACK_SIZE: usize = 1024 * 1024;
+
+/// 沙盒堆上限。书源 jsLib + 一章正文的字符串处理远超这个量级属异常；设上限是为了让
+/// `'x'.repeat(1e9)` 这类脚本尽快抛 OOM 异常交回 Rust，而不是把进程拖到被系统杀掉。
+/// 与 replace_rule_js.rs 一致（那里只处理一章文本用 64MB，书源规则更复杂故取 128MB）。
+const JS_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
+
+/// 单次 JS 求值的执行预算：正常书源规则在毫秒级完成，10 秒已是很宽松的上限。
+/// 注意这是"累计连续执行时间"，不含 java.ajax 等阻塞 IO 的等待（见 EvalBudget）。
+const JS_EVAL_BUDGET: Duration = Duration::from_secs(10);
+
+/// 超过这个时间间隔的两次 interrupt 回调，判定为中间夹了阻塞操作（网络/wait），
+/// 不计入执行预算并清零累计。这样慢网络不会误伤正常书源。
+const JS_IO_GAP: Duration = Duration::from_millis(1500);
+
+/// 单次求值的执行预算状态，由 interrupt handler 在 JS 执行期间更新。
+///
+/// rquickjs 的 interrupt handler 在字节码执行间隙被调用，返回 `true` 会抛出
+/// **脚本无法捕获**的异常，把控制权交回 Rust。没有它的话，外层 timeout 只能让
+/// IPC 停止等待，`spawn_blocking` 线程会继续把 CPU 烧在死循环上直到进程退出。
+///
+/// 为什么用"累计间隔"而非固定 deadline：`java.ajax` 走 `run_blocking_http`，
+/// 阻塞期间 JS 引擎不执行、handler 不触发，但墙钟一直在走；若用固定 deadline，
+/// 一次 30 秒的慢请求就会让后续正常 JS 一进入就被判超时。改为只累加"小于 IO
+/// 间隔"的连续回调间隔，等效于只计纯 JS 执行时间。
+#[derive(Default)]
+struct EvalBudget {
+    last: Option<Instant>,
+    accumulated: Duration,
+}
+
+impl EvalBudget {
+    /// 每次求值前重置，避免复用上下文时累计上一次的预算。
+    fn reset(&mut self) {
+        self.last = None;
+        self.accumulated = Duration::ZERO;
+    }
+
+    fn on_tick(&mut self) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.last {
+            let gap = now.saturating_duration_since(last);
+            if gap < JS_IO_GAP {
+                self.accumulated += gap;
+            } else {
+                // 中间夹了阻塞 IO：清零，重新只计连续执行时间。
+                self.accumulated = Duration::ZERO;
+            }
+        }
+        self.last = Some(now);
+        self.accumulated >= JS_EVAL_BUDGET
+    }
+}
+
+/// 给新建 Runtime 装好三件套：栈上限、堆内存上限、超时中断 handler。
+/// `budget` 由调用方持有并在每次求值前 reset —— handler 通过 Arc 共享它。
+fn install_js_sandbox(runtime: &Runtime, budget: &Arc<Mutex<EvalBudget>>) {
+    runtime.set_max_stack_size(JS_MAX_STACK_SIZE);
+    runtime.set_memory_limit(JS_MEMORY_LIMIT);
+    let handler_budget = budget.clone();
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        handler_budget
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .on_tick()
+    })));
+}
+
 const DEFAULT_JS_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 /// blocking client 只能在无 tokio runtime 的线程上构建/使用, 所有访问都走 `run_blocking_http`。
 static JS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
@@ -2730,6 +2797,8 @@ struct CachedJsContext {
     /// jsLib 源码的 md5, 用于判断是否需要重建上下文。
     lib_key: String,
     context: Context,
+    /// 该上下文的超时预算；每次求值前 reset。Runtime 的 handler 持有同一份 Arc。
+    budget: Arc<Mutex<EvalBudget>>,
 }
 
 thread_local! {
@@ -2767,10 +2836,11 @@ fn with_reusable_context<T>(
     let _guard = EvalDepthGuard;
 
     // 嵌套调用无法借用外层正在使用的 Context, 退化为一次性上下文(仍需加载 jsLib,
-    // 否则嵌套脚本里的 jsLib 函数不可用)。
+    // 否则嵌套脚本里的 jsLib 函数不可用)。同样要装沙箱防护 —— 嵌套 eval 也会跑脚本。
     if nested {
         let runtime = Runtime::new()?;
-        runtime.set_max_stack_size(JS_MAX_STACK_SIZE);
+        let budget = Arc::new(Mutex::new(EvalBudget::default()));
+        install_js_sandbox(&runtime, &budget);
         let context = Context::full(&runtime)?;
         return context.with(|ctx| f(ctx, true));
     }
@@ -2778,27 +2848,36 @@ fn with_reusable_context<T>(
     let cached = JS_CONTEXT.with(|cell| {
         let slot = cell.borrow();
         match slot.as_ref() {
-            Some(entry) if entry.lib_key == lib_key => Some(entry.context.clone()),
+            Some(entry) if entry.lib_key == lib_key => {
+                Some((entry.context.clone(), entry.budget.clone()))
+            }
             _ => None,
         }
     });
 
-    let (context, initialize) = match cached {
-        Some(context) => (context, false),
+    let (context, initialize, budget) = match cached {
+        Some((context, budget)) => (context, false, budget),
         None => {
             let runtime = Runtime::new()?;
-            runtime.set_max_stack_size(JS_MAX_STACK_SIZE);
+            let budget = Arc::new(Mutex::new(EvalBudget::default()));
+            install_js_sandbox(&runtime, &budget);
             let context = Context::full(&runtime)?;
             JS_CONTEXT.with(|cell| {
                 *cell.borrow_mut() = Some(CachedJsContext {
                     lib_key: lib_key.to_string(),
                     context: context.clone(),
+                    budget: budget.clone(),
                 });
             });
-            (context, true)
+            (context, true, budget)
         }
     };
 
+    // 每次求值前清零预算：复用上下文时不能继承上一次的累计执行时间。
+    budget
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .reset();
     let result = context.with(|ctx| f(ctx, initialize));
     if result.is_err() { JS_CONTEXT.with(|cell| { *cell.borrow_mut() = None; }); }
     result
@@ -5737,6 +5816,43 @@ pub fn panel_digest(payload: &JsonValue) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 超时预算：连续执行累计到上限即触发中断；中间夹一次阻塞 IO 则清零重算。
+    /// 直接构造状态逼近阈值，避免真等 10 秒。
+    #[test]
+    fn eval_budget_accumulates_and_resets_on_io_gap() {
+        let mut budget = super::EvalBudget::default();
+        // 先攒到接近上限（未触发）。
+        budget.accumulated = super::JS_EVAL_BUDGET - super::Duration::from_millis(500);
+        // last 设在 800ms 前：间隔 800ms < IO_GAP(1500ms)，算"连续执行"，
+        // 累加后越过剩余 500ms 额度 → 触发中断。若 last 就在当下，gap 只有微秒级，
+        // 累加量不足，测不出触发。
+        budget.last = Some(super::Instant::now() - super::Duration::from_millis(800));
+        assert!(budget.on_tick(), "连续执行越过预算必须触发中断");
+    }
+
+    #[test]
+    fn eval_budget_io_gap_clears_accumulated() {
+        let mut budget = super::EvalBudget::default();
+        budget.accumulated = super::JS_EVAL_BUDGET - super::Duration::from_millis(100);
+        // 造一个"上次 tick 在很久以前"的状态：模拟中间发生了阻塞网络请求。
+        budget.last = Some(super::Instant::now() - super::JS_IO_GAP - super::Duration::from_millis(100));
+        // 这次 tick 的间隔大于 IO gap → 清零，不应触发。
+        assert!(!budget.on_tick(), "阻塞 IO 后的首次 tick 不应判超时");
+        assert_eq!(budget.accumulated, super::Duration::ZERO);
+    }
+
+    #[test]
+    fn eval_budget_reset_clears_state() {
+        let mut budget = super::EvalBudget::default();
+        budget.accumulated = super::JS_EVAL_BUDGET;
+        budget.last = Some(super::Instant::now());
+        budget.reset();
+        assert_eq!(budget.accumulated, super::Duration::ZERO);
+        assert!(budget.last.is_none());
+        // 复用上下文重置后，第一次 tick 只是建立基线，不触发。
+        assert!(!budget.on_tick());
+    }
 
     /// 持久变量超限后：超大值被丢弃，条目数裁到上限且保留字典序靠前的键。
     #[test]

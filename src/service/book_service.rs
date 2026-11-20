@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Instant};
+use futures::StreamExt;
 
 /// 书源 JS 调用 `java.showBrowser(url, html)` 时捕获的请求, 供前端弹出面板。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -376,6 +377,35 @@ pub async fn handle_source_panel_bridge(
 ///
 /// 只用于**阅读时的单章加载**。缓存是并发多章的(见 `cache_book_sse`),
 /// 同一时刻不同章节处在不同阶段, 单一阶段对它没有意义。
+/// 单章内多页续页的并发抓取上限。用有界并发而非无上限 `join_all`，
+/// 避免一次解析出几十个续页时同时打出几十个请求——那会触发站点限流/风控，
+/// 也可能把内存与连接池瞬时拉高。4 兼顾加速与克制（书源自身 concurrentRate
+/// 仍会独立生效）。
+const CONTENT_PAGE_CONCURRENCY: usize = 4;
+
+/// 一页正文的抓取+解析结果。`index` 是该页在“波”中的原始序号，
+/// 并发完成顺序不定，聚合时按它排序才能保证正文拼接顺序稳定。
+struct ContentPageOutcome {
+    index: usize,
+    content: String,
+}
+
+/// 把并发完成的页结果按原始序号排序后拼成正文。并发下完成顺序不定，
+/// 必须按 index 归位，否则正文段落会错乱。空页被跳过，非空页之间用换行分隔。
+fn assemble_content_pages(mut pages: Vec<ContentPageOutcome>) -> String {
+    pages.sort_by_key(|page| page.index);
+    let mut assembled = String::new();
+    for page in pages {
+        if !page.content.is_empty() {
+            if !assembled.is_empty() {
+                assembled.push('\n');
+            }
+            assembled.push_str(&page.content);
+        }
+    }
+    assembled
+}
+
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentLoadStage {
@@ -631,6 +661,10 @@ pub struct BookService {
     // 缓存清单是单个 JSON 文件，读改写必须按书串行。批量任务与
     // 概览重建可能并发落到同一本书，没有这把锁时后写者会用旧快照覆盖前者。
     cache_manifest_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+    // 目录缓存的"读-追加-写"同样是非原子的：后台续页任务会并发追加同一目录，
+    // 没有锁时两个任务各读到同一旧快照、后写覆盖先写，直接丢章节。按 toc_url
+    // 分键串行，与 cache_manifest_locks 同一模式。
+    chapter_append_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -872,6 +906,7 @@ impl BookService {
             bookshelf_write_lock: Arc::new(Mutex::new(())),
             bookshelf_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_manifest_locks: Arc::new(RwLock::new(HashMap::new())),
+            chapter_append_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -2656,71 +2691,101 @@ impl BookService {
         }
         tracing::debug!("get_content cache miss, fetching from network");
 
+        // 按“波”并发预取，一次只处理一章：
+        //   波 1 = 主章 URL；抓完解析出本章全部续页 → 波 2 并发抓这些续页；
+        //   再从波 2 的解析结果找新续页 → 波 3 …直到没有新页。
+        // 波内并发有界(CONTENT_PAGE_CONCURRENCY)，波与波之间串行——因为下一波的
+        // URL 必须先解析上一波的 DOM 才知道，这是无法并行的依赖链；但同一波内的
+        // 多页(书源一次列出 `_1/_2/_3` 的情形)现在并发抓取，不再逐页等网络往返。
+        // 链式 nextContentUrl(每页只给下一页)仍退化为每波一页，行为与串行版一致。
         let mut all_content = String::new();
-        let mut visited_urls = std::collections::HashSet::new();
-        // 正文续页用队列而非单链：书源的 nextContentUrl 可能一次列出本章全部页码
-        // (如 `4507_1/_2/_3`)。按 legado 语义应全部抓完。VecDeque 保持 DOM 给出的
-        // 顺序(通常是页码升序)，visited 去重让重复列举的页码和环自动收敛。
-        let mut pending: std::collections::VecDeque<String> =
-            std::collections::VecDeque::from([chapter_url.to_string()]);
+        let mut visited_urls: HashSet<String> = HashSet::new();
+        let mut wave: Vec<String> = vec![chapter_url.to_string()];
         let book_ctx = self.js_book_context(user_ns, book_url, chapter_url).await;
 
-        // Follow pagination to get all content pages
-        while let Some(current_url) = pending.pop_front() {
-            if visited_urls.contains(&current_url) {
-                tracing::debug!("get_content detected loop, skipping: {}", current_url);
-                continue;
+        while !wave.is_empty() {
+            // 进入本波时先统一去重：已抓过的页不再重复请求，重复列举与环自动收敛。
+            let mut current_batch = Vec::with_capacity(wave.len());
+            for url in wave {
+                if !visited_urls.insert(url.clone()) {
+                    tracing::debug!("get_content detected loop, skipping: {}", url);
+                    continue;
+                }
+                current_batch.push(url);
             }
-            visited_urls.insert(current_url.clone());
+            if current_batch.is_empty() {
+                break;
+            }
 
             notify(ContentLoadStage::Fetching);
-            tracing::debug!("get_content fetching: {}", current_url);
-            let res = match self
-                .fetch_source_url(user_ns, source, &current_url, &source.book_source_url, "")
-                .await
-            {
-                Ok(res) => res,
-                // 走到这里说明本地没有这一章的正文(有的话上面已经直接返回了),
-                // 请求失败就是失败, 没有可兜底的内容。
-                Err(e) => return Err(e),
+            // 有界并发：buffer_unordered 让已完成的页先进入聚合，但并发数受上限约束。
+            // 每个 outcome 携带 index，聚合时据此排序，保证正文顺序与 DOM/书源给出
+            // 的顺序一致，不因并发完成先后而错乱。
+            let fetch_one = |(index, url): (usize, String)| {
+                let source = source.clone();
+                let book_ctx = book_ctx.clone();
+                let book_url = book_url.to_string();
+                let user_ns = user_ns.to_string();
+                async move {
+                    let result: Result<(String, Vec<String>), AppError> = async {
+                        let res = self
+                            .fetch_source_url(&user_ns, &source, &url, &source.book_source_url, "")
+                            .await?;
+                        // 正文规则里往往会触发书源脚本与段评请求, 这是最耗时的一步。
+                        let (content, _logs) = self
+                            .parse_content_blocking(
+                                &user_ns,
+                                &source,
+                                &res,
+                                &url,
+                                &book_url,
+                                book_ctx,
+                            )
+                            .await?;
+                        let next_urls = self.source_scope(&user_ns, &source, || {
+                            self.parser.next_content_urls(&source, &res.body, &res.url)
+                        })?;
+                        Ok((content, next_urls))
+                    }
+                    .await;
+                    (index, url, result)
+                }
             };
-            tracing::debug!("get_content fetch done, body len={}", res.body.len());
-            // 正文规则里往往会触发书源脚本与段评请求, 这是最耗时的一步
-            notify(ContentLoadStage::Parsing);
-            let (content, _logs) = self
-                .parse_content_blocking(
-                    user_ns,
-                    source,
-                    &res,
-                    &current_url,
-                    book_url,
-                    book_ctx.clone(),
-                )
-                .await?;
-            tracing::debug!("get_content parsed content len={}", content.len());
 
-            if !content.is_empty() {
+            let mut outcomes = futures::stream::iter(
+                current_batch
+                    .into_iter()
+                    .enumerate()
+                    .map(fetch_one),
+            )
+            .buffer_unordered(CONTENT_PAGE_CONCURRENCY);
+
+            notify(ContentLoadStage::Parsing);
+            let mut page_results: Vec<ContentPageOutcome> = Vec::new();
+            let mut next_wave: Vec<String> = Vec::new();
+            while let Some((index, url, result)) = outcomes.next().await {
+                let (content, next_urls) = result?;
+                page_results.push(ContentPageOutcome { index, content });
+                for next_url in &next_urls {
+                    if should_follow_content_page(chapter_url, &url, next_url)
+                        && !visited_urls.contains(next_url)
+                        && !next_wave.contains(next_url)
+                    {
+                        tracing::debug!("get_content queued next page: {}", next_url);
+                        next_wave.push(next_url.clone());
+                    }
+                }
+            }
+
+            // 按原始序号排序后再拼接，保证并发下正文顺序稳定。
+            let wave_content = assemble_content_pages(page_results);
+            if !wave_content.is_empty() {
                 if !all_content.is_empty() {
                     all_content.push('\n');
                 }
-                all_content.push_str(&content);
+                all_content.push_str(&wave_content);
             }
-
-            // Check for next pages — 可能一次返回多个续页 URL
-            let next_urls = self.source_scope(user_ns, source, || {
-                self.parser.next_content_urls(source, &res.body, &res.url)
-            })?;
-            for next_url in next_urls {
-                if should_follow_content_page(chapter_url, &current_url, &next_url) {
-                    if !visited_urls.contains(&next_url) && !pending.contains(&next_url) {
-                        tracing::debug!("get_content queued next page: {}", next_url);
-                        pending.push_back(next_url);
-                    }
-                } else {
-                    // 该候选是下一章而非续页：跳过它，但继续处理队列里已入队的其它续页
-                    tracing::debug!("get_content next_url appears to be next chapter, skipping: {}", next_url);
-                }
-            }
+            wave = next_wave;
         }
 
         tracing::debug!("get_content final content len={}", all_content.len());
@@ -2895,6 +2960,26 @@ impl BookService {
             return lock;
         }
         let mut locks = self.cache_manifest_locks.write().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// 同一目录的章节缓存"读-追加-写"串行锁。后台续页任务可能并发追加同一目录，
+    /// 持锁保证每份追加都基于最新快照，不丢章节。
+    async fn chapter_append_lock(&self, user_ns: &str, toc_url: &str) -> Arc<Mutex<()>> {
+        let key = format!("{user_ns}::{}", normalize_source_url(toc_url));
+        if let Some(lock) = self
+            .chapter_append_locks
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+        {
+            return lock;
+        }
+        let mut locks = self.chapter_append_locks.write().await;
         locks
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -4505,7 +4590,7 @@ impl BookService {
                 .map_err(|e| AppError::Internal(e.into()))?;
         }
         let data = serde_json::to_string(list).map_err(|e| AppError::BadRequest(e.to_string()))?;
-        fs::write(&path, data)
+        crate::util::atomic_write::atomic_write(&path, data.as_bytes())
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
         Ok(())
@@ -4705,7 +4790,7 @@ impl BookService {
         }
         let data =
             serde_json::to_string(chapters).map_err(|e| AppError::BadRequest(e.to_string()))?;
-        fs::write(&path, data)
+        crate::util::atomic_write::atomic_write(&path, data.as_bytes())
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
         Ok(())
@@ -4717,6 +4802,9 @@ impl BookService {
         toc_url: &str,
         new_chapters: &Vec<BookChapter>,
     ) -> Result<Vec<BookChapter>, AppError> {
+        // 读-追加-写整体持锁：并发续页任务各读到同一旧快照会互相覆盖、丢章节。
+        let lock = self.chapter_append_lock(user_ns, toc_url).await;
+        let _guard = lock.lock().await;
         let mut existing = self
             .load_chapter_list_cache(user_ns, toc_url)
             .await?
@@ -5712,6 +5800,36 @@ async fn collect_referenced_cover_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 并发完成的页顺序不定，必须按原始 index 归位，正文段落才不会错乱。
+    #[test]
+    fn assemble_content_pages_restores_order_after_concurrency() {
+        // 模拟 buffer_unordered 的完成顺序：第 3 页先完成、第 1 页最后完成。
+        let pages = vec![
+            ContentPageOutcome { index: 2, content: "第三段".to_string() },
+            ContentPageOutcome { index: 0, content: "第一段".to_string() },
+            ContentPageOutcome { index: 3, content: "".to_string() },
+            ContentPageOutcome { index: 1, content: "第二段".to_string() },
+        ];
+        assert_eq!(assemble_content_pages(pages), "第一段\n第二段\n第三段");
+    }
+
+    /// 全部是空页时拼接结果为空，不会留下多余换行。
+    #[test]
+    fn assemble_content_pages_skips_empty() {
+        let pages = vec![
+            ContentPageOutcome { index: 0, content: "".to_string() },
+            ContentPageOutcome { index: 1, content: "正文".to_string() },
+        ];
+        assert_eq!(assemble_content_pages(pages), "正文");
+    }
+
+    /// 并发度上限必须 >1 才有加速意义，且保持在对站点友好的克制值。
+    #[test]
+    fn content_page_concurrency_is_bounded() {
+        assert!(CONTENT_PAGE_CONCURRENCY > 1, "并发上限需允许同波多页并行");
+        assert!(CONTENT_PAGE_CONCURRENCY <= 8, "并发上限过大会触发站点风控/内存峰值");
+    }
 
     /// zzbook 类站点：`4507.html` 是主章，`4507_1.html` / `4507_2.html` 是续页。
     /// 续页从 `_1` 起算，若页码判断要求 `>= 2`，第一续页会被误判成“下一章”
@@ -7948,5 +8066,53 @@ mod tests {
         let cfg_a = books[0].read_config.as_ref().unwrap();
         assert_eq!(cfg_a.use_replace_rule, Some(true));
         assert!(books[1].read_config.is_none(), "非法 override 值不应创建 read_config");
+    }
+
+    /// 并发追加同一目录：两个任务各追加一批，最终必须都保留（不丢章节）。
+    /// 这是 append_chapter_list_cache 竞态修复的回归测试。
+    #[tokio::test]
+    async fn concurrent_chapter_append_does_not_lose_chapters() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "reader-append-race-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let service = BookService::new(
+            HttpClient::new(5, None).unwrap(),
+            RuleEngine::new().unwrap(),
+            FileCache::new(storage_dir.join("cache")),
+            storage_dir.to_str().unwrap(),
+        );
+        let toc = "https://source.example/book/1/";
+
+        let make = |title: &str| BookChapter {
+            title: title.to_string(),
+            url: format!("https://source.example/{title}"),
+            ..Default::default()
+        };
+        let batch_a = vec![make("a1"), make("a2")];
+        let batch_b = vec![make("b1"), make("b2")];
+
+        let s1 = service.clone();
+        let toc1 = toc.to_string();
+        let t1 = tokio::spawn(async move { s1.append_chapter_list_cache("default", &toc1, &batch_a).await });
+        let s2 = service.clone();
+        let toc2 = toc.to_string();
+        let t2 = tokio::spawn(async move { s2.append_chapter_list_cache("default", &toc2, &batch_b).await });
+
+        let r1 = t1.await.unwrap().unwrap();
+        let r2 = t2.await.unwrap().unwrap();
+        // 两个任务各自返回的长度可能不同（取决于谁先完成），但最终落盘必须含全部 4 章。
+        let final_list = service
+            .load_chapter_list_cache("default", toc)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_list.len(), 4, "并发追加丢失了章节: {final_list:?}");
+        assert_eq!(r1.len() + r2.len(), 6, "两次追加共应写入 2+4=6（含先写的一批）");
+        let titles: Vec<_> = final_list.iter().map(|c| c.title.as_str()).collect();
+        assert!(titles.contains(&"a1") && titles.contains(&"a2"));
+        assert!(titles.contains(&"b1") && titles.contains(&"b2"));
+
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
     }
 }

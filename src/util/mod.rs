@@ -1,3 +1,4 @@
+pub mod atomic_write;
 pub mod crypto;
 pub mod hash;
 pub mod path_safe;

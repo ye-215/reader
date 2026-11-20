@@ -44,10 +44,16 @@ impl FileCache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(&path, value).await?;
+        // 原子写：强杀进程时不会留下半截正文被当成有效缓存永久返回。
+        crate::util::atomic_write::atomic_write(&path, value.as_bytes()).await?;
         let count =
             crate::util::text::visible_char_count(value).to_string();
-        if let Err(err) = fs::write(self.count_path(user_ns, book_key, chapter_key), count).await {
+        if let Err(err) = crate::util::atomic_write::atomic_write(
+            self.count_path(user_ns, book_key, chapter_key),
+            count.as_bytes(),
+        )
+        .await
+        {
             tracing::warn!("写入章节字数 sidecar 失败(将从正文现算): {err}");
         }
         Ok(())
@@ -81,7 +87,7 @@ impl FileCache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(path, count.to_string()).await?;
+        crate::util::atomic_write::atomic_write(path, count.to_string().as_bytes()).await?;
         Ok(())
     }
 
