@@ -25,7 +25,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -287,7 +287,7 @@ pub async fn handle_source_panel_bridge(
                 book: serde_json::from_str(&entry.book_json).unwrap_or_else(|_| json!({})),
                 chapter: serde_json::from_str(&entry.chapter_json).unwrap_or_else(|_| json!({})),
             };
-            let output = tokio::task::spawn_blocking(move || {
+            let handle = tokio::task::spawn_blocking(move || {
                 let execute = || crate::parser::js::with_book_context(Some(book_ctx), || {
                     crate::parser::js::with_source(&source, || {
                         crate::parser::js::with_book_url(Some(&entry.book_url), || {
@@ -310,9 +310,8 @@ pub async fn handle_source_panel_bridge(
                     Some(http) => crate::parser::js::with_http_context(http, execute),
                     None => execute(),
                 }
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            });
+            let output = await_js_with_timeout(handle, "面板脚本").await.map_err(|e| e.to_string())?;
             output.map_err(|e| format!("脚本执行失败: {e}"))
         }
         "ajax" | "connect" | "http" | "fetch" => {
@@ -324,7 +323,7 @@ pub async fn handle_source_panel_bridge(
             let action = action.to_string();
             let payload = payload.clone();
             let entry = entry.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let handle = tokio::task::spawn_blocking(move || {
                 let execute = || {
                     if action == "fetch" {
                         crate::parser::js::run_panel_fetch(&source, &entry.url, &action, &payload)
@@ -336,9 +335,8 @@ pub async fn handle_source_panel_bridge(
                     Some(http) => crate::parser::js::with_http_context(http, execute),
                     None => execute(),
                 }
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            });
+            let result = await_js_with_timeout(handle, "面板网络请求").await.map_err(|e| e.to_string())?;
             result.map_err(|e| e.to_string())
         }
         // 面板内再次调 `java.showBrowser`: 登记为新面板并回传 panelId,
@@ -383,6 +381,45 @@ pub async fn handle_source_panel_bridge(
 /// 仍会独立生效）。
 const CONTENT_PAGE_CONCURRENCY: usize = 4;
 
+/// 书源 JS 求值的外层墙钟兜底。
+///
+/// `js.rs` 的 interrupt handler 只累计"纯 JS 执行时间"，靠回调打断死循环；但
+/// libregexp 的病态回溯（`/(a+)+$/` 之类）全程在 C 层、不回调 handler，内层预算
+/// 永不累加 → 求值永久占住 blocking 线程、IPC 挂起。这里给每个跑书源脚本的
+/// `spawn_blocking` 套一层宽松墙钟：正常书源即便含多次 java.ajax 慢网络也远不到
+/// 这个量级，只有真正卡死的任务才会命中。
+///
+/// 与 `replace_rule` 的两层保护对齐：内层 handler 主动打断（线程立即停），外层
+/// 墙钟兜底。代价：超时只能停止等待，被 C 层回溯占住的 blocking 线程要等回溯
+/// 自然结束（或进程退出）才释放——彻底解决需换线性时间正则引擎或进程隔离，
+/// 超出本次范围。就"不让 UI/IPC 永久挂死"这个目标，本兜底已足够。
+const JS_EVAL_WALL_CLOCK: Duration = Duration::from_secs(90);
+
+/// 给书源 JS 求值的 `spawn_blocking` 套外层墙钟。超时返回 BadRequest；
+/// 任务自身 panic/cancel 统一折成 Internal。调用点原本对 JoinError 有特殊语义
+/// （如搜索解析把 cancelled 当空结果）的，不要直接用本 helper，需自行包 timeout。
+async fn await_js_with_timeout<T>(
+    handle: tokio::task::JoinHandle<T>,
+    label: &str,
+) -> Result<T, AppError> {
+    await_js_with_deadline(handle, label, JS_EVAL_WALL_CLOCK).await
+}
+
+/// 参数化版本，便于测试用短墙钟验证超时分支。
+async fn await_js_with_deadline<T>(
+    handle: tokio::task::JoinHandle<T>,
+    label: &str,
+    wall_clock: Duration,
+) -> Result<T, AppError> {
+    match tokio::time::timeout(wall_clock, handle).await {
+        Err(_) => Err(AppError::BadRequest(format!(
+            "{label}执行超时，可能存在死循环或病态正则，已跳过本次解析"
+        ))),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(AppError::Internal(anyhow::anyhow!("{label}任务失败: {err}"))),
+    }
+}
+
 /// 一页正文的抓取+解析结果。`index` 是该页在“波”中的原始序号，
 /// 并发完成顺序不定，聚合时按它排序才能保证正文拼接顺序稳定。
 struct ContentPageOutcome {
@@ -404,6 +441,51 @@ fn assemble_content_pages(mut pages: Vec<ContentPageOutcome>) -> String {
         }
     }
     assembled
+}
+
+/// 由本波的续页发现结果构建下一波 URL。
+///
+/// `buffer_unordered` 按完成先后 yield，续页若按到达顺序入队，其顺序取决于
+/// 网络快慢；当书源一波给出多个续页、且续页又各自引出下一级续页时（嵌套分页），
+/// 下一波的顺序会与父页顺序错位，最终正文段落串位。因此这里按父页 index 排序，
+/// 同一父页内保持书源给出的续页顺序，再扁平化去重。
+///
+/// `visited` 为当前已抓取/已入波的 URL 集合；返回新加入的 URL（不含 visited）。
+fn collect_next_wave(discovered: Vec<(usize, Vec<String>)>, visited: &HashSet<String>) -> Vec<String> {
+    let mut discovered = discovered;
+    discovered.sort_by_key(|(index, _)| *index);
+    let mut wave = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (_, next_urls) in discovered {
+        for url in next_urls {
+            if !visited.contains(&url) && seen.insert(url.clone()) {
+                wave.push(url);
+            }
+        }
+    }
+    wave
+}
+
+/// 从按 key 分片的锁注册表取锁；注册表只存 Weak，最后一个持有者释放后条目失效。
+/// 这样长期运行（书籍增删、频繁换目录）不会为每个 key 永久残留一个空锁。
+/// 读命中需 `upgrade` 成功才可用（Arc 仍存活）；否则进写锁重建，并顺手清理失效项。
+async fn keyed_lock(
+    registry: &Arc<RwLock<HashMap<String, Weak<Mutex<()>>>>>,
+    key: String,
+) -> Arc<Mutex<()>> {
+    if let Some(lock) = registry.read().await.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let mut locks = registry.write().await;
+    // 双重检查：等写锁期间可能已被别的任务重建。
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    // 清理已无人持有的条目，避免注册表无限增长。
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -660,11 +742,13 @@ pub struct BookService {
     bookshelf_cache: Arc<RwLock<HashMap<String, CachedShelf>>>,
     // 缓存清单是单个 JSON 文件，读改写必须按书串行。批量任务与
     // 概览重建可能并发落到同一本书，没有这把锁时后写者会用旧快照覆盖前者。
-    cache_manifest_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+    // Weak 引用：锁仅在当前有持有者时存活，最后一个持有者释放后由 keyed_lock 清理，
+    // 避免长期运行下每个书/目录永久残留一个空锁。
+    cache_manifest_locks: Arc<RwLock<HashMap<String, Weak<Mutex<()>>>>>,
     // 目录缓存的"读-追加-写"同样是非原子的：后台续页任务会并发追加同一目录，
     // 没有锁时两个任务各读到同一旧快照、后写覆盖先写，直接丢章节。按 toc_url
     // 分键串行，与 cache_manifest_locks 同一模式。
-    chapter_append_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+    chapter_append_locks: Arc<RwLock<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -942,8 +1026,8 @@ impl BookService {
     ) -> Result<T, AppError> {
         let context = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
         let source = source.clone();
-        tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || with_source(&source, || f(&source))))
-            .await.map_err(|err| AppError::Internal(anyhow::anyhow!("书源任务失败: {err}")))
+        let handle = tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || with_source(&source, || f(&source))));
+        await_js_with_timeout(handle, "书源任务").await
     }
 
     async fn analyze_request(&self, user_ns: &str, source: &BookSource, rule: &str, key: &str, page: i32, base: &str) -> Result<RequestSpec, AppError> {
@@ -1383,9 +1467,10 @@ impl BookService {
         let source_copy = source.clone();
         let keyword = keyword.to_string();
         let analyze_context = context.clone();
-        let mut spec = tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(analyze_context, || {
+        let spec_handle = tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(analyze_context, || {
             analyze_url(&rule, &keyword, 1, &source_copy.book_source_url, &source_copy)
-        })).await.map_err(|err| AppError::Internal(err.into()))??;
+        }));
+        let mut spec = await_js_with_timeout(spec_handle, "登录验证").await??;
         spec.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
         spec.headers.push(("Cookie".into(), cookie.trim().to_string()));
         let client = if let Some(proxy) = spec.proxy.as_deref() {
@@ -1400,8 +1485,8 @@ impl BookService {
         }
         if source.login_check_js.as_deref().unwrap_or("").trim().is_empty() { return Ok(false); }
         let source_copy = source.clone();
-        tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || apply_login_check_js(&source_copy, res)))
-            .await.map_err(|err| AppError::Internal(err.into()))??;
+        let check_handle = tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || apply_login_check_js(&source_copy, res)));
+        let _checked = await_js_with_timeout(check_handle, "登录校验脚本").await??;
         Ok(true)
     }
 
@@ -1743,11 +1828,17 @@ impl BookService {
         let context = self.http.source_context(user_ns, &source.book_source_url, None).map_err(AppError::Internal)?;
         let parser = self.parser.clone();
         let (source, body, url) = (source.clone(), body.to_string(), url.to_string());
-        match tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || {
+        // 保留 cancelled→空列表、panic→resume_unwind 的原语义，只在最外层加墙钟兜底。
+        let handle = tokio::task::spawn_blocking(move || crate::parser::js::with_http_context(context, || {
             take_js_logs();
             let books = crate::parser::js::with_search_context(&key, page, || if explore { parser.explore_books(&source, &body, &url) } else { parser.search_books(&source, &body, &url) });
             (books, take_js_logs())
-        })).await {
+        }));
+        let join = match tokio::time::timeout(JS_EVAL_WALL_CLOCK, handle).await {
+            Ok(join) => join,
+            Err(_) => return Err(AppError::BadRequest("书源解析执行超时，可能存在死循环或病态正则，已跳过".into())),
+        };
+        match join {
             Ok((books, logs)) => {
                 if books.is_empty() {
                     if let Some(error) = first_js_error(&logs) { return Err(AppError::BadRequest(format!("书源解析失败: {error}"))); }
@@ -2530,7 +2621,7 @@ impl BookService {
         let source_key = book_url.to_string();
         let chapter_url = chapter_url.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             take_js_logs();
             clear_show_browser_request();
             let base_url = chapter_url.clone();
@@ -2562,9 +2653,8 @@ impl BookService {
             output
                 .map(|value| (value, logs, browser))
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("执行 click 脚本失败: {e}")))
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("click 脚本任务失败: {e}")))?
+        });
+        await_js_with_timeout(handle, "click 脚本").await?
     }
 
     /// 正文规则可能在 JS 里发起同步网络请求, 放到阻塞线程池执行, 不占用异步 worker。
@@ -2588,7 +2678,7 @@ impl BookService {
         // 章节标识。这里优先用调用方给的章节 URL。
         let url = if base_url.trim().is_empty() { res.url.clone() } else { base_url.to_string() };
         let source_key = source_key.to_string();
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             take_js_logs();
             let content = crate::parser::js::with_http_context(context, || with_book_context(book_ctx, || {
                 parser.content(&source, &body, &url, Some(&source_key))
@@ -2606,9 +2696,8 @@ impl BookService {
                 return Err(AppError::BadRequest("书源正文解析为空，请检查正文规则".to_string()));
             }
             Ok((content, logs))
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("正文解析任务失败: {e}")))?
+        });
+        await_js_with_timeout(handle, "正文解析").await?
     }
 
     pub async fn get_content(
@@ -2748,6 +2837,8 @@ impl BookService {
                         Ok((content, next_urls))
                     }
                     .await;
+                    // outcome 携带父页 index：续页顺序跟随父页，而非 buffer_unordered
+                    // 的完成顺序，否则嵌套分页时下一波会与正文顺序错位。
                     (index, url, result)
                 }
             };
@@ -2762,19 +2853,20 @@ impl BookService {
 
             notify(ContentLoadStage::Parsing);
             let mut page_results: Vec<ContentPageOutcome> = Vec::new();
-            let mut next_wave: Vec<String> = Vec::new();
+            // 按父页 index 收集续页发现结果，收齐后统一排序去重（见 collect_next_wave）。
+            let mut discovered: Vec<(usize, Vec<String>)> = Vec::new();
             while let Some((index, url, result)) = outcomes.next().await {
                 let (content, next_urls) = result?;
                 page_results.push(ContentPageOutcome { index, content });
-                for next_url in &next_urls {
-                    if should_follow_content_page(chapter_url, &url, next_url)
-                        && !visited_urls.contains(next_url)
-                        && !next_wave.contains(next_url)
-                    {
-                        tracing::debug!("get_content queued next page: {}", next_url);
-                        next_wave.push(next_url.clone());
-                    }
-                }
+                let followed: Vec<String> = next_urls
+                    .into_iter()
+                    .filter(|next_url| should_follow_content_page(chapter_url, &url, next_url))
+                    .collect();
+                discovered.push((index, followed));
+            }
+            let next_wave = collect_next_wave(discovered, &visited_urls);
+            for next_url in &next_wave {
+                tracing::debug!("get_content queued next page: {}", next_url);
             }
 
             // 按原始序号排序后再拼接，保证并发下正文顺序稳定。
@@ -2950,40 +3042,14 @@ impl BookService {
     /// 并发时后写者如果拿着旧快照就会覆盖别人刚写入的来源与失败记录。
     async fn cache_manifest_lock(&self, user_ns: &str, book_url: &str) -> Arc<Mutex<()>> {
         let key = format!("{user_ns}::{}", normalize_source_url(book_url));
-        if let Some(lock) = self
-            .cache_manifest_locks
-            .read()
-            .await
-            .get(&key)
-            .cloned()
-        {
-            return lock;
-        }
-        let mut locks = self.cache_manifest_locks.write().await;
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        keyed_lock(&self.cache_manifest_locks, key).await
     }
 
     /// 同一目录的章节缓存"读-追加-写"串行锁。后台续页任务可能并发追加同一目录，
     /// 持锁保证每份追加都基于最新快照，不丢章节。
     async fn chapter_append_lock(&self, user_ns: &str, toc_url: &str) -> Arc<Mutex<()>> {
         let key = format!("{user_ns}::{}", normalize_source_url(toc_url));
-        if let Some(lock) = self
-            .chapter_append_locks
-            .read()
-            .await
-            .get(&key)
-            .cloned()
-        {
-            return lock;
-        }
-        let mut locks = self.chapter_append_locks.write().await;
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        keyed_lock(&self.chapter_append_locks, key).await
     }
 
     pub async fn load_cache_manifest(
@@ -4649,43 +4715,65 @@ impl BookService {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let data = fs::read_to_string(&path)
-            .await
-            .map_err(|e| AppError::Internal(e.into()))?;
-        let mut list: Vec<Book> = match serde_json::from_str(&data) {
-            Ok(list) => list,
-            Err(primary_err) => {
-                let recovered = recover_bookshelf_entries(&data)
-                    .ok_or_else(|| AppError::BadRequest(primary_err.to_string()))?;
-                tracing::warn!(
-                    "recovered malformed bookshelf for user_ns={}, path={}, entries={}",
-                    user_ns,
-                    path.display(),
-                    recovered.len()
-                );
-                // 自愈回写会失效缓存, 所以填缓存必须在这之后。
-                self.write_bookshelf(user_ns, &recovered).await?;
-                recovered
+
+        // 未命中时, "二次校验 -> 读盘 -> 填缓存"在同一把 cache 写锁内完成, 与
+        // write_bookshelf 的缓存失效互斥。否则写者可能在读者读盘后写盘并失效缓存,
+        // 读者再把旧快照填回, 导致 TTL 内一直返回陈旧书架。
+        // 只取 cache 锁、不取 bookshelf_write_lock: 本函数多数调用点已持有后者,
+        // 再取会死锁; 锁序仍是 write_lock -> cache, 无环。
+        let (mut list, needs_self_heal) = {
+            let mut cache = self.bookshelf_cache.write().await;
+            // 等写锁期间可能已被别的读者填好, 二次校验直接复用。
+            if let Some(entry) = cache
+                .get(user_ns)
+                .filter(|entry| entry.saved_at.elapsed() < SHELF_CACHE_TTL)
+            {
+                (entry.books.clone(), false)
+            } else {
+                let data = fs::read_to_string(&path)
+                    .await
+                    .map_err(|e| AppError::Internal(e.into()))?;
+                let (parsed, heal) = match serde_json::from_str(&data) {
+                    Ok(list) => (list, false),
+                    Err(primary_err) => {
+                        let recovered = recover_bookshelf_entries(&data)
+                            .ok_or_else(|| AppError::BadRequest(primary_err.to_string()))?;
+                        tracing::warn!(
+                            "recovered malformed bookshelf for user_ns={}, path={}, entries={}",
+                            user_ns,
+                            path.display(),
+                            recovered.len()
+                        );
+                        (recovered, true)
+                    }
+                };
+                let mut parsed: Vec<Book> = parsed;
+                for book in &mut parsed {
+                    sanitize_book_urls(book);
+                }
+                // 自愈分支不在锁内填缓存: 下面的回写会失效缓存, 下次读重新取真值。
+                if !heal {
+                    if cache.len() >= SHELF_CACHE_CAP {
+                        cache.clear();
+                    }
+                    cache.insert(
+                        user_ns.to_string(),
+                        CachedShelf {
+                            books: parsed.clone(),
+                            saved_at: Instant::now(),
+                        },
+                    );
+                }
+                (parsed, heal)
             }
         };
-        for book in &mut list {
-            sanitize_book_urls(book);
+
+        // 自愈回写放到 cache 锁外: write_bookshelf 内部会取 cache 写锁失效缓存,
+        // 在锁内调用会重入死锁。
+        if needs_self_heal {
+            self.write_bookshelf(user_ns, &list).await?;
         }
-        // 填入真值缓存。写路径持 bookshelf_write_lock, 这里用独立的 cache 锁,
-        // 锁序固定为 write_lock -> cache, 与 write_bookshelf 内的失效保持一致。
-        {
-            let mut cache = self.bookshelf_cache.write().await;
-            if cache.len() >= SHELF_CACHE_CAP {
-                cache.clear();
-            }
-            cache.insert(
-                user_ns.to_string(),
-                CachedShelf {
-                    books: list.clone(),
-                    saved_at: Instant::now(),
-                },
-            );
-        }
+
         let snapshot = crate::parser::js::book_read_config_overrides_snapshot();
         apply_book_read_config_overrides(&mut list, &snapshot);
         Ok(list)
@@ -4776,7 +4864,21 @@ impl BookService {
         Ok(Some(list))
     }
 
+    /// 整表覆盖写。与 append 共用同一把按目录串行锁，避免"用户刷新目录的整表写"
+    /// 与"后台续页的追加写"交错互相覆盖。锁内不重入——append 走 inner 版本。
     pub async fn save_chapter_list_cache(
+        &self,
+        user_ns: &str,
+        toc_url: &str,
+        chapters: &Vec<BookChapter>,
+    ) -> Result<(), AppError> {
+        let lock = self.chapter_append_lock(user_ns, toc_url).await;
+        let _guard = lock.lock().await;
+        self.save_chapter_list_cache_inner(user_ns, toc_url, chapters).await
+    }
+
+    /// 无锁的实际写盘逻辑。调用方必须已持有对应目录的 chapter_append_lock。
+    async fn save_chapter_list_cache_inner(
         &self,
         user_ns: &str,
         toc_url: &str,
@@ -4815,7 +4917,8 @@ impl BookService {
             ch.index = start_index + i as i32;
             existing.push(ch);
         }
-        self.save_chapter_list_cache(user_ns, toc_url, &existing)
+        // 已持有本章节锁，必须走 inner 避免重入同一把 Mutex 死锁。
+        self.save_chapter_list_cache_inner(user_ns, toc_url, &existing)
             .await?;
         Ok(existing)
     }
@@ -5829,6 +5932,81 @@ mod tests {
     fn content_page_concurrency_is_bounded() {
         assert!(CONTENT_PAGE_CONCURRENCY > 1, "并发上限需允许同波多页并行");
         assert!(CONTENT_PAGE_CONCURRENCY <= 8, "并发上限过大会触发站点风控/内存峰值");
+    }
+
+    /// 书源 JS 墙钟兜底：卡死任务超时后返回 BadRequest，不再挂住调用方。
+    #[tokio::test]
+    async fn js_wall_clock_times_out_stuck_task() {
+        let handle = tokio::task::spawn_blocking(|| {
+            // 模拟病态正则/死循环：占住线程直到墙钟兜底生效。
+            std::thread::sleep(Duration::from_secs(2));
+            42
+        });
+        let result = await_js_with_deadline(handle, "测试任务", Duration::from_millis(50)).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "超时应返回 BadRequest, got {result:?}");
+    }
+
+    /// 墙钟兜底不影响正常完成的任务：值原样透传。
+    #[tokio::test]
+    async fn js_wall_clock_passes_through_completed_task() {
+        let handle = tokio::task::spawn_blocking(|| 7 * 6);
+        let result = await_js_with_deadline(handle, "测试任务", Duration::from_secs(5)).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    /// 续页必须按父页 index 排序，不能按 buffer_unordered 的完成先后。
+    /// 场景：波2 有 _1/_2 两页，_2 先完成吐出 _2_1，_1 后完成吐出 _1_1；
+    /// 若按完成顺序入下一波会变成 [_2_1, _1_1]，正文段落错乱。正确应为 [_1_1, _2_1]。
+    #[test]
+    fn collect_next_wave_orders_by_parent_index_not_completion_order() {
+        let visited = HashSet::new();
+        // 完成顺序：index=1 的结果先到达（discovered 里排前面），index=0 后到达。
+        let discovered = vec![
+            (1usize, vec!["p2_1.html".to_string()]),
+            (0usize, vec!["p1_1.html".to_string()]),
+        ];
+        let wave = collect_next_wave(discovered, &visited);
+        assert_eq!(wave, vec!["p1_1.html", "p2_1.html"]);
+    }
+
+    /// 同一父页内保持书源给出的续页顺序；visited 与本波重复 URL 都去掉。
+    #[test]
+    fn collect_next_wave_dedups_and_keeps_sibling_order() {
+        let visited: HashSet<String> = ["already.html".to_string()].into_iter().collect();
+        let discovered = vec![
+            (0usize, vec![
+                "a1.html".to_string(),
+                "already.html".to_string(), // visited，跳过
+                "a2.html".to_string(),
+            ]),
+            (1usize, vec![
+                "a1.html".to_string(), // 与 index0 重复，跳过
+                "b1.html".to_string(),
+            ]),
+        ];
+        let wave = collect_next_wave(discovered, &visited);
+        assert_eq!(wave, vec!["a1.html", "a2.html", "b1.html"]);
+    }
+
+    /// 分键锁注册表用 Weak：持有期间同一 key 取到同一把锁；最后一个持有者
+    /// 释放后条目应被回收，不会永久累积空锁。
+    #[tokio::test]
+    async fn keyed_lock_reuses_while_held_and_collects_after_drop() {
+        let registry: Arc<RwLock<HashMap<String, Weak<Mutex<()>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let a = keyed_lock(&registry, "k".to_string()).await;
+        let b = keyed_lock(&registry, "k".to_string()).await;
+        // 同一 key 在持有期间返回同一把锁（同一 Mutex 地址）。
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(registry.read().await.len(), 1);
+
+        drop(a);
+        drop(b);
+        // 全部释放后条目应为失效 Weak；下一次取锁时清理并重建。
+        let c = keyed_lock(&registry, "k".to_string()).await;
+        assert_eq!(registry.read().await.len(), 1, "重建后仍只有一个条目");
+        drop(c);
     }
 
     /// zzbook 类站点：`4507.html` 是主章，`4507_1.html` / `4507_2.html` 是续页。

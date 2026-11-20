@@ -2841,6 +2841,9 @@ fn with_reusable_context<T>(
         let runtime = Runtime::new()?;
         let budget = Arc::new(Mutex::new(EvalBudget::default()));
         install_js_sandbox(&runtime, &budget);
+        // 与缓存路径保持同一不变量：求值前 reset。此处 budget 虽为新建，显式
+        // reset 可防止将来在 install 与 with 之间插入 on_tick 调用时继承脏状态。
+        budget.lock().unwrap_or_else(|error| error.into_inner()).reset();
         let context = Context::full(&runtime)?;
         return context.with(|ctx| f(ctx, true));
     }
